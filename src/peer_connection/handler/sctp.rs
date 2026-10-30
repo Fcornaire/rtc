@@ -597,7 +597,18 @@ impl<'a>
                                 ::datachannel::data_channel::DataChannel::get_reliability_params(
                                     data_channel_open.channel_type,
                                 );
-                            let mut stream = conn.open_stream(message.stream_id, message.ppi)?;
+
+                            let is_already_open =
+                                message.negotiated && conn.stream(message.stream_id).is_ok();
+                            let mut stream = if is_already_open {
+                                debug!(
+                                    "negotiated stream {} already open, applying reliability",
+                                    message.stream_id
+                                );
+                                conn.stream(message.stream_id)?
+                            } else {
+                                conn.open_stream(message.stream_id, message.ppi)?
+                            };
                             stream.set_reliability_params(
                                 unordered,
                                 reliability_type,
@@ -1447,6 +1458,76 @@ mod tests {
                     if matches!(app.data_channel_event, DataChannelEvent::Open)
             )),
             "the DataChannel Open event must follow SCTP establishment"
+        );
+    }
+
+    /// A negotiated channel has no handshake, so the peer's first DATA can create the stream
+    /// before the local open runs. That open must still apply the channel's reliability.
+    #[test]
+    fn negotiated_open_applies_reliability_to_a_stream_the_peer_created() {
+        const STREAM_ID: StreamId = 1;
+        const DATA_FLAG_UNORDERED: u8 = 0x04;
+
+        let now = Instant::now();
+        let mut e = establish();
+        let association_handle = e.client_ch.0;
+        let early_data = server_datagrams_carrying(&mut e, STREAM_ID, 1, now);
+        let (mut ctx, _) = run_client(now, e, early_data, 0);
+
+        let write = |ppi, payload: &[u8], negotiated| TaggedRTCMessageInternal {
+            now,
+            transport: TransportContext::default(),
+            message: RTCMessageInternal::Dtls(DTLSMessage::Sctp(DataChannelMessage {
+                association_handle,
+                stream_id: STREAM_ID,
+                ppi,
+                payload: BytesMut::from(payload),
+                negotiated,
+            })),
+        };
+        let open = Message::DataChannelOpen(DataChannelOpen {
+            channel_type: ChannelType::PartialReliableRexmitUnordered,
+            priority: CHANNEL_PRIORITY_NORMAL,
+            reliability_parameter: 0,
+            label: b"negotiated".to_vec(),
+            protocol: Vec::new(),
+        })
+        .marshal()
+        .expect("DCEP OPEN");
+
+        let mut handler = SctpHandler::new(&mut ctx, 0);
+        handler
+            .handle_write(write(PayloadProtocolIdentifier::Dcep, &open[..], true))
+            .expect("open the stream the peer created");
+        handler
+            .handle_write(write(PayloadProtocolIdentifier::Binary, &[7; 64], false))
+            .expect("write on the negotiated stream");
+
+        let mut flushed = vec![];
+        while let Some(m) = handler.poll_write() {
+            flushed.push(m);
+        }
+        let data_flags: Vec<u8> = flushed
+            .iter()
+            .filter_map(|m| match &m.message {
+                RTCMessageInternal::Dtls(DTLSMessage::Raw(raw))
+                    if raw.len() > 13 && raw[12] == CT_PAYLOAD_DATA =>
+                {
+                    Some(raw[13])
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            data_flags.len(),
+            1,
+            "a negotiated open must stay off the wire"
+        );
+        assert_ne!(
+            data_flags[0] & DATA_FLAG_UNORDERED,
+            0,
+            "the channel's reliability must apply to the peer-created stream"
         );
     }
 
